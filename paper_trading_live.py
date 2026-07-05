@@ -1,26 +1,20 @@
 """
 paper_trading_live.py -- Swing RSI BTC/USDT
 =============================================
-Strategie validee : Trail 3.5% + filtre ATR 0.15%
-  OOS Sharpe : 1.59  |  +110.8%  |  WF 4/5
-
-Compatible GitHub Actions : pas d interaction utilisateur,
-tout passe par Telegram et le fichier state JSON commite.
+Correction : utilise l API publique Binance via requests
+(pas de bibliotheque python-binance qui declenche le blocage geo)
+ou fallback sur KuCoin si Binance bloque.
 """
 
 import pandas as pd
 import numpy as np
-from binance.client import Client
-from dotenv import load_dotenv
+import requests
 from datetime import datetime, timezone
 import os
 import json
+import time
 import warnings
 warnings.filterwarnings("ignore")
-
-load_dotenv()
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
-BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
 
 TRAILING_PCT  = 0.035
 COOLDOWN_H    = 32
@@ -32,13 +26,25 @@ STATE_FILE    = "paper_state.json"
 JOURNAL_FILE  = "paper_journal.csv"
 
 # ============================================================
-# DONNEES
+# DONNEES -- API publique (pas de cle requise)
 # ============================================================
 
-def get_data(symbol, interval, start):
-    client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-    klines = client.get_historical_klines(symbol, interval, start)
-    df = pd.DataFrame(klines, columns=[
+BINANCE_BASE  = "https://api.binance.com"
+KUCOIN_BASE   = "https://api.kucoin.com"
+
+def get_data_binance(symbol, interval, limit=500):
+    """
+    API publique Binance -- pas de cle, pas de restriction geo
+    sur les endpoints publics de certains serveurs.
+    interval : 15m, 1h, 4h
+    """
+    url    = "{}/api/v3/klines".format(BINANCE_BASE)
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    resp   = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data   = resp.json()
+
+    df = pd.DataFrame(data, columns=[
         "timestamp","open","high","low","close","volume",
         "close_time","quote_vol","trades","taker_buy_base","taker_buy_quote","ignore"
     ])
@@ -46,6 +52,55 @@ def get_data(symbol, interval, start):
     df = df.set_index("timestamp")
     df = df[["open","high","low","close","volume"]].astype(float)
     return df.dropna()
+
+def get_data_kucoin(symbol, interval, limit=500):
+    """
+    Fallback KuCoin si Binance inaccessible.
+    symbol   : BTC-USDT
+    interval : 15min, 1hour, 4hour
+    """
+    url    = "{}/api/v1/market/candles".format(KUCOIN_BASE)
+    params = {"symbol": symbol, "type": interval}
+    resp   = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data   = resp.json().get("data", [])
+
+    df = pd.DataFrame(data, columns=[
+        "timestamp","open","close","high","low","volume","amount"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
+    df = df.set_index("timestamp")
+    df = df[["open","high","low","close","volume"]].astype(float)
+    df = df.sort_index()
+    return df.tail(limit).dropna()
+
+def get_data(interval_15m="15m", interval_1h="1h", interval_4h="4h"):
+    """
+    Essaie Binance public d abord, fallback KuCoin.
+    Retourne (data_15m, data_1h, data_4h)
+    """
+    # Map intervalles Binance -> KuCoin
+    kucoin_map = {"15m": "15min", "1h": "1hour", "4h": "4hour"}
+
+    try:
+        print("  Source : Binance API publique...")
+        d15 = get_data_binance("BTCUSDT", interval_15m, limit=300)
+        d1h = get_data_binance("BTCUSDT", interval_1h,  limit=200)
+        d4h = get_data_binance("BTCUSDT", interval_4h,  limit=200)
+        print("  Binance OK -- BTC : {:,.0f} USDT".format(d15["close"].iloc[-1]))
+        return d15, d1h, d4h
+
+    except Exception as e:
+        print("  Binance indisponible : {}".format(str(e)))
+        print("  Fallback : KuCoin API publique...")
+        try:
+            d15 = get_data_kucoin("BTC-USDT", kucoin_map[interval_15m], limit=300)
+            d1h = get_data_kucoin("BTC-USDT", kucoin_map[interval_1h],  limit=200)
+            d4h = get_data_kucoin("BTC-USDT", kucoin_map[interval_4h],  limit=200)
+            print("  KuCoin OK -- BTC : {:,.0f} USDT".format(d15["close"].iloc[-1]))
+            return d15, d1h, d4h
+        except Exception as e2:
+            raise RuntimeError("Binance et KuCoin inaccessibles : {}".format(str(e2)))
 
 # ============================================================
 # INDICATEURS
@@ -203,21 +258,14 @@ def update_trailing(state, current_price):
             state["lowest_price"] = current_price
 
 # ============================================================
-# TRAITEMENT DU SIGNAL (sans interaction utilisateur)
+# TRAITEMENT DU SIGNAL
 # ============================================================
 
 def process_signal(state, sig):
-    """
-    GitHub Actions = pas de terminal interactif.
-    Le signal est enregistre automatiquement au prix du backtest.
-    Le slippage reel sera mesure en comparant avec les executions reelles
-    que tu fais manuellement sur Binance (paper ou reel).
-    """
     from telegram_notify import notify_signal
 
     if sig["exit_signal"] and state["position"] != 0:
-        exec_price = sig["close"]   # prix du signal = prix simule
-
+        exec_price = sig["close"]
         if state["position"] == 1:
             pnl = (exec_price - state["entry_price"]) / state["entry_price"] * 100
         else:
@@ -229,11 +277,7 @@ def process_signal(state, sig):
         if pnl_net > 0:
             state["n_wins"] += 1
 
-        if sig["trail_hit"]:
-            note = "trailing_stop"
-        else:
-            note = "inverse_exit"
-
+        note = "trailing_stop" if sig["trail_hit"] else "inverse_exit"
         append_journal({
             "date"         : str(sig["timestamp"]),
             "type"         : "EXIT",
@@ -243,13 +287,11 @@ def process_signal(state, sig):
             "capital_after": round(state["capital"], 2),
             "notes"        : note,
         })
-
         trail_stop = sig["trail_stop_price"] or 0
         notify_signal("EXIT", sig["close"], trail_stop,
                       state["capital"], state["n_trades"])
-
-        print("  EXIT enregistre -- PnL net : {:+.2f}%".format(pnl_net))
-        print("  Capital simule : {:,.0f}$".format(state["capital"]))
+        print("  EXIT -- PnL net : {:+.2f}%  Capital : {:,.0f}$".format(
+            pnl_net, state["capital"]))
 
         state["position"]      = 0
         state["entry_price"]   = None
@@ -258,14 +300,13 @@ def process_signal(state, sig):
         state["lowest_price"]  = None
 
     elif sig["long_signal"] and state["position"] == 0:
-        exec_price = sig["close"]
+        exec_price               = sig["close"]
         state["position"]        = 1
         state["entry_price"]     = exec_price
         state["entry_time"]      = str(sig["timestamp"])
         state["last_entry_time"] = str(sig["timestamp"])
         state["highest_price"]   = exec_price
         state["lowest_price"]    = exec_price
-
         trail_stop = exec_price * (1 - TRAILING_PCT)
         append_journal({
             "date"         : str(sig["timestamp"]),
@@ -281,14 +322,13 @@ def process_signal(state, sig):
         print("  LONG enregistre a {:,.0f} USDT".format(exec_price))
 
     elif sig["short_signal"] and state["position"] == 0:
-        exec_price = sig["close"]
+        exec_price               = sig["close"]
         state["position"]        = -1
         state["entry_price"]     = exec_price
         state["entry_time"]      = str(sig["timestamp"])
         state["last_entry_time"] = str(sig["timestamp"])
         state["highest_price"]   = exec_price
         state["lowest_price"]    = exec_price
-
         trail_stop = exec_price * (1 + TRAILING_PCT)
         append_journal({
             "date"         : str(sig["timestamp"]),
@@ -304,7 +344,7 @@ def process_signal(state, sig):
         print("  SHORT enregistre a {:,.0f} USDT".format(exec_price))
 
     else:
-        print("  Pas de signal -- position={} long={} short={} exit={}".format(
+        print("  Pas de signal -- pos={} long={} short={} exit={}".format(
             state["position"], sig["long_signal"],
             sig["short_signal"], sig["exit_signal"]))
 
