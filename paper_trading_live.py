@@ -1,9 +1,9 @@
 """
 paper_trading_live.py -- Swing RSI BTC/USDT
 =============================================
-Correction : utilise l API publique Binance via requests
-(pas de bibliotheque python-binance qui declenche le blocage geo)
-ou fallback sur KuCoin si Binance bloque.
+Source de donnees : KuCoin API publique uniquement
+(Binance bloque toutes les IPs GitHub Actions, meme l API publique)
+Aucune cle API requise.
 """
 
 import pandas as pd
@@ -12,7 +12,6 @@ import requests
 from datetime import datetime, timezone
 import os
 import json
-import time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -26,36 +25,20 @@ STATE_FILE    = "paper_state.json"
 JOURNAL_FILE  = "paper_journal.csv"
 
 # ============================================================
-# DONNEES -- API publique (pas de cle requise)
+# DONNEES -- KuCoin API publique (aucune restriction geo)
 # ============================================================
 
-BINANCE_BASE  = "https://api.binance.com"
-KUCOIN_BASE   = "https://api.kucoin.com"
+KUCOIN_BASE = "https://api.kucoin.com"
 
-def get_data_binance(symbol, interval, limit=500):
-    """
-    API publique Binance -- pas de cle, pas de restriction geo
-    sur les endpoints publics de certains serveurs.
-    interval : 15m, 1h, 4h
-    """
-    url    = "{}/api/v3/klines".format(BINANCE_BASE)
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp   = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    data   = resp.json()
+INTERVAL_MAP = {
+    "15m": "15min",
+    "1h" : "1hour",
+    "4h" : "4hour",
+}
 
-    df = pd.DataFrame(data, columns=[
-        "timestamp","open","high","low","close","volume",
-        "close_time","quote_vol","trades","taker_buy_base","taker_buy_quote","ignore"
-    ])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df = df.set_index("timestamp")
-    df = df[["open","high","low","close","volume"]].astype(float)
-    return df.dropna()
-
-def get_data_kucoin(symbol, interval, limit=500):
+def get_kucoin(symbol, interval, limit=300):
     """
-    Fallback KuCoin si Binance inaccessible.
+    Recupere les bougies KuCoin.
     symbol   : BTC-USDT
     interval : 15min, 1hour, 4hour
     """
@@ -63,44 +46,30 @@ def get_data_kucoin(symbol, interval, limit=500):
     params = {"symbol": symbol, "type": interval}
     resp   = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
-    data   = resp.json().get("data", [])
 
-    df = pd.DataFrame(data, columns=[
-        "timestamp","open","close","high","low","volume","amount"
+    raw  = resp.json().get("data", [])
+    if not raw:
+        raise RuntimeError("KuCoin : reponse vide pour {} {}".format(symbol, interval))
+
+    df = pd.DataFrame(raw, columns=[
+        "timestamp", "open", "close", "high", "low", "volume", "amount"
     ])
     df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
     df = df.set_index("timestamp")
-    df = df[["open","high","low","close","volume"]].astype(float)
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
     df = df.sort_index()
     return df.tail(limit).dropna()
 
-def get_data(interval_15m="15m", interval_1h="1h", interval_4h="4h"):
+def get_data():
     """
-    Essaie Binance public d abord, fallback KuCoin.
-    Retourne (data_15m, data_1h, data_4h)
+    Retourne (data_15m, data_1h, data_4h) depuis KuCoin.
     """
-    # Map intervalles Binance -> KuCoin
-    kucoin_map = {"15m": "15min", "1h": "1hour", "4h": "4hour"}
-
-    try:
-        print("  Source : Binance API publique...")
-        d15 = get_data_binance("BTCUSDT", interval_15m, limit=300)
-        d1h = get_data_binance("BTCUSDT", interval_1h,  limit=200)
-        d4h = get_data_binance("BTCUSDT", interval_4h,  limit=200)
-        print("  Binance OK -- BTC : {:,.0f} USDT".format(d15["close"].iloc[-1]))
-        return d15, d1h, d4h
-
-    except Exception as e:
-        print("  Binance indisponible : {}".format(str(e)))
-        print("  Fallback : KuCoin API publique...")
-        try:
-            d15 = get_data_kucoin("BTC-USDT", kucoin_map[interval_15m], limit=300)
-            d1h = get_data_kucoin("BTC-USDT", kucoin_map[interval_1h],  limit=200)
-            d4h = get_data_kucoin("BTC-USDT", kucoin_map[interval_4h],  limit=200)
-            print("  KuCoin OK -- BTC : {:,.0f} USDT".format(d15["close"].iloc[-1]))
-            return d15, d1h, d4h
-        except Exception as e2:
-            raise RuntimeError("Binance et KuCoin inaccessibles : {}".format(str(e2)))
+    print("  Source : KuCoin API publique...")
+    d15 = get_kucoin("BTC-USDT", "15min", limit=300)
+    d1h = get_kucoin("BTC-USDT", "1hour", limit=200)
+    d4h = get_kucoin("BTC-USDT", "4hour", limit=200)
+    print("  KuCoin OK -- BTC : {:,.0f} USDT".format(d15["close"].iloc[-1]))
+    return d15, d1h, d4h
 
 # ============================================================
 # INDICATEURS
@@ -171,7 +140,8 @@ def append_journal(row_dict):
     file_exists = os.path.exists(JOURNAL_FILE)
     with open(JOURNAL_FILE, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "date","type","price_signal","direction","pnl_pct","capital_after","notes"
+            "date", "type", "price_signal", "direction",
+            "pnl_pct", "capital_after", "notes"
         ])
         if not file_exists:
             writer.writeheader()
@@ -196,8 +166,8 @@ def get_current_signal(data_15m, data_1h, data_4h, state):
     h1 = h1_mom.iloc[i]
     a  = atr.iloc[i]
 
-    greens  = (close.iloc[i] > close.iloc[i-1]) and (close.iloc[i-1] > close.iloc[i-2])
-    reds    = (close.iloc[i] < close.iloc[i-1]) and (close.iloc[i-1] < close.iloc[i-2])
+    greens = (close.iloc[i] > close.iloc[i-1]) and (close.iloc[i-1] > close.iloc[i-2])
+    reds   = (close.iloc[i] < close.iloc[i-1]) and (close.iloc[i-1] < close.iloc[i-2])
     atr_ok  = (a / cl) >= MIN_ATR_PCT
     atr_pct = round(a / cl * 100, 3)
 
@@ -319,7 +289,7 @@ def process_signal(state, sig):
         })
         notify_signal("LONG", exec_price, trail_stop,
                       state["capital"], state["n_trades"])
-        print("  LONG enregistre a {:,.0f} USDT".format(exec_price))
+        print("  LONG a {:,.0f} USDT".format(exec_price))
 
     elif sig["short_signal"] and state["position"] == 0:
         exec_price               = sig["close"]
@@ -341,7 +311,7 @@ def process_signal(state, sig):
         })
         notify_signal("SHORT", exec_price, trail_stop,
                       state["capital"], state["n_trades"])
-        print("  SHORT enregistre a {:,.0f} USDT".format(exec_price))
+        print("  SHORT a {:,.0f} USDT".format(exec_price))
 
     else:
         print("  Pas de signal -- pos={} long={} short={} exit={}".format(
