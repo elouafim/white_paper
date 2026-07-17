@@ -4,3 +4,4 @@ date,type,price_signal,direction,pnl_pct,capital_after,notes
 2026-07-08 22:30:00,ENTRY,62322.9,1,,484.5,LONG
 2026-07-13 17:45:00,EXIT,61905.5,1,-0.82,480.53,trailing_stop
 2026-07-14 04:30:00,ENTRY,62708.8,1,,480.53,LONG
+2026-07-17 06:00:00,EXIT,62829.9,1,0.043,480.74,trailing_stop
