@@ -1,12 +1,12 @@
 {
-  "position": -1,
-  "entry_price": 78137.3,
-  "entry_time": "2026-09-09 21:45:00",
-  "highest_price": 78137.3,
-  "lowest_price": 75599.6,
+  "position": 0,
+  "entry_price": null,
+  "entry_time": null,
+  "highest_price": null,
+  "lowest_price": null,
   "last_entry_time": "2026-09-09 21:45:00",
-  "capital": 552.0253497291463,
-  "n_trades": 9,
+  "capital": 531.2568792912172,
+  "n_trades": 10,
   "n_wins": 2,
   "paper_start": "2026-07-05T22:38:36.665612+00:00"
 }
